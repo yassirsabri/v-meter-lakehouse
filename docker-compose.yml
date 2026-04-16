@@ -1,0 +1,261 @@
+
+services:
+  # PostgreSQL: metadata + MLflow backend
+  postgres:
+    image: postgres:16-alpine
+    container_name: pfe_postgres-2
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_password}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO: S3-compatible object storage
+  minio:
+    image: minio/minio:latest
+    container_name: pfe_minio-2
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_password}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MinIO bucket init
+  minio-init:
+    image: minio/mc:latest
+    container_name: pfe_minio_init-2
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio_password}
+    entrypoint: >
+      /bin/sh -c "
+        /usr/bin/mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD;
+        /usr/bin/mc mb -p local/bronze || true;
+        /usr/bin/mc mb -p local/silver || true;
+        /usr/bin/mc mb -p local/gold || true;
+        /usr/bin/mc mb -p local/mlflow || true;
+        echo 'MinIO buckets created';
+      "
+
+  # Spark master
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    container_name: pfe_spark_master-2
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+    volumes:
+      - ./scripts:/opt/spark-app/scripts
+      - ./data:/opt/spark-app/data
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "4040:4040"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080', timeout=5)"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+
+  # Spark worker ( can be duplicated if it there is a large dataset )
+  spark-worker:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    container_name: pfe_spark_worker-2
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+    ports:
+      - "8081:8081"
+
+  # MLflow
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    container_name: pfe_mlflow-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      BACKEND_STORE_URI: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_password}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      ARTIFACT_ROOT: s3://mlflow/
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+         "import urllib.request; urllib.request.urlopen('http://localhost:5000', timeout=5)"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+  nessie:
+    image: projectnessie/nessie:0.76.6
+    container_name: pfe_nessie-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-lakehouse}
+      QUARKUS_DATASOURCE_USERNAME: ${POSTGRES_USER:-postgres}
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-postgres_password}
+      QUARKUS_HTTP_PORT: "19120"
+      QUARKUS_OIDC_ENABLED: "false"
+      QUARKUS_OPENTELEMETRY_ENABLED: "false"
+      QUARKUS_OTEL_ENABLED: "false"
+    ports:
+      - "19120:19120"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:19120/api/v2/config >/dev/null 2>&1 || curl -fsS http://localhost:19120/api/v2/config >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+      
+
+ 
+  airflow-init:
+    image: apache/airflow:2.9.3
+    container_name: pfe_airflow_init-2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+
+
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: minio_password
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./scripts:/opt/spark-app/scripts
+      - ./data:/opt/spark-app/data
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@local --password admin || true
+      "
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3
+    container_name: pfe_airflow_webserver-2
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: minio_password
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./scripts:/opt/spark-app/scripts
+      - ./data:/opt/spark-app/data
+    ports:
+      - "8088:8080"
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3
+    container_name: pfe_airflow_scheduler-2
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: admin
+      MINIO_SECRET_KEY: minio_password
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./scripts:/opt/spark-app/scripts
+      - ./data:/opt/spark-app/data
+    command: scheduler  
+
+
+volumes:
+  minio_data:
+  postgres_data:

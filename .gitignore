@@ -1,0 +1,9 @@
+.env
+data/
+airflow/logs/
+pycache/
+*.parquet
+*.csv
+*.xlsx
+*.xls
+
