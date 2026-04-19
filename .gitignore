@@ -1,7 +1,8 @@
 .env
 data/
 airflow/logs/
-pycache/
+__pycache__/
+*.pyc
 *.parquet
 *.csv
 *.xlsx
