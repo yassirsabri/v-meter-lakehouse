@@ -1,3 +1,4 @@
+
 # Workstream A - Infrastructure Startup and Operations Runbook
 
 ## Quick Start
@@ -16,3 +17,4 @@ curl http://localhost:9001 > /dev/null 2>&1 && echo "MinIO Console OK"
 curl http://localhost:8080 > /dev/null 2>&1 && echo "Spark Master UI OK"
 curl http://localhost:5000 > /dev/null 2>&1 && echo "MLflow OK"
 curl http://localhost:19120/api/v2/config > /dev/null 2>&1 && echo "Nessie OK"
+

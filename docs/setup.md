@@ -1,3 +1,4 @@
+
 # Setup
 
 ## Requirements
@@ -43,3 +44,5 @@ Run the three scripts in order:
 
 - The source file is expected in the mounted `data` folder.
 - MinIO credentials are taken from the environment or Docker Compose.
+
+

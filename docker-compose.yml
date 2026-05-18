@@ -1,4 +1,5 @@
 
+
 services:
   # PostgreSQL: metadata + MLflow backend
   postgres:
@@ -171,7 +172,10 @@ services:
 
  
   airflow-init:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: pfe_airflow:custom
     container_name: pfe_airflow_init-2
     depends_on:
       postgres:
@@ -181,7 +185,6 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
 
 
       MINIO_ENDPOINT: http://minio:9000
@@ -200,7 +203,10 @@ services:
       "
 
   airflow-webserver:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: pfe_airflow:custom
     container_name: pfe_airflow_webserver-2
     depends_on:
       airflow-init:
@@ -214,7 +220,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: minio_password
@@ -229,7 +235,10 @@ services:
     command: webserver
 
   airflow-scheduler:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: pfe_airflow:custom 
     container_name: pfe_airflow_scheduler-2
     depends_on:
       airflow-init:
@@ -243,7 +252,6 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: minio_password
@@ -254,7 +262,27 @@ services:
       - ./scripts:/opt/spark-app/scripts
       - ./data:/opt/spark-app/data
     command: scheduler  
-
+  prediction-api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: pfe_prediction_api-2
+    depends_on:
+      mlflow:
+        condition: service_started
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+      MODEL_LOCAL_PATH: /opt/spark-app/data/models
+      MODEL_NAME: Videometer_Model
+      MODEL_STAGE: Production
+    volumes:
+      - ./data:/opt/spark-app/data
+      - ./scripts:/opt/spark-app/scripts
+    ports:
+      - "8000:8000"  
 
 volumes:
   minio_data:

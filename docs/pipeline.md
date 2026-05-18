@@ -1,3 +1,4 @@
+
 # Pipeline
 
 ## Bronze
@@ -33,3 +34,5 @@ This stage groups the data by image and date, then calculates:
 Apache Airflow runs the pipeline in this order:
 
 Bronze -> Silver -> Gold
+
+

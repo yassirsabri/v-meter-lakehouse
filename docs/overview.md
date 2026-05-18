@@ -1,3 +1,4 @@
+
 # Project Overview
 
 This repository is part of the final year internship project:
@@ -26,4 +27,6 @@ The project focuses on building a practical open source lakehouse stack for high
 ## Current Repository Focus
 
 At this stage, the repository contains the containerized data platform and the Bronze, Silver, and Gold pipeline implementation, with Airflow orchestration for execution flow.
+
+
 

@@ -1,3 +1,4 @@
+
 # Limitations
 
 This project is currently running in a local environment and is not yet deployed to a cloud platform.
@@ -17,3 +18,5 @@ This project is currently running in a local environment and is not yet deployed
 - The Silver processing logic must be revised because some transformations are not necessary.
 - Processing multiple files from the data folder into the s3:/bronze zone has not been tested yet.
 - The current Silver logic assumes that database columns are known in advance; schema-agnostic processing is not implemented yet.
+
+

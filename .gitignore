@@ -7,4 +7,5 @@ __pycache__/
 *.csv
 *.xlsx
 *.xls
-
+/opt/spark-app/data/models/
+/tmp/mlflow_artifacts/

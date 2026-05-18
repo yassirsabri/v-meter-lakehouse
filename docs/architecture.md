@@ -1,3 +1,4 @@
+
 # Architecture
 
 The project uses the following components:
@@ -23,3 +24,5 @@ The project uses the following components:
 - Bronze: raw data
 - Silver: cleaned data
 - Gold: aggregated analytical data
+
+
