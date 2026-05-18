@@ -183,8 +183,8 @@ services:
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false" # Set to true to load example DAGs
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?A Fernet key must be set in your .env file}
 
 
       MINIO_ENDPOINT: http://minio:9000
@@ -218,8 +218,8 @@ services:
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false" # Set to true to load example DAGs
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?A Fernet key must be set in your .env file}
 
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
@@ -250,8 +250,8 @@ services:
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false" # Set to true to load example DAGs
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?A Fernet key must be set in your .env file}
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: minio_password
