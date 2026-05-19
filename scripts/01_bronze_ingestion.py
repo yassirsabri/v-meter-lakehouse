@@ -2,109 +2,134 @@
 """
 Bronze ingestion pipeline.
 
-Purpose
-- Read the raw source file from the mounted data directory.
-- Preserve the data with minimal transformation.
-- Add technical metadata for lineage and traceability.
-- Write the result as Parquet to the Bronze zone in MinIO.
-
-Why this stage matters
-- Bronze is the raw landing layer of the medallion architecture.
-- It keeps the original source values as intact as possible.
-- Metadata fields help identify when, how, and from which file the data was loaded.
+Auto-discovers CSV/XLSX files in the data directory, extracts crop name from
+filename (e.g., barley.csv -> barley), and writes each to a separate S3 path.
 """
 
+import argparse
 import hashlib
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
-DATA_SOURCE_PATH = os.getenv(
-    "DATA_SOURCE_PATH",
-    "/opt/spark-app/data/data_barley_videometer.csv",
-)
+DATA_DIR = "/opt/spark-app/data"
+VALID_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_password")
 
 BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze")
-BRONZE_KEY = os.getenv("BRONZE_KEY", "videometer/raw_measurements")
-BRONZE_S3_PATH = f"s3://{BRONZE_BUCKET}/{BRONZE_KEY}"
+BRONZE_BASE = f"s3a://{BRONZE_BUCKET}/videometer"
 
-# Explicit S3 options are required to avoid anonymous access attempts.
-S3_STORAGE_OPTIONS = {
-    "key": MINIO_ACCESS_KEY,
-    "secret": MINIO_SECRET_KEY,
-    "client_kwargs": {"endpoint_url": MINIO_ENDPOINT},
-    "anon": False,
-}
+CSV_SEPARATOR = os.getenv("CSV_SEPARATOR", "")
 
 
 # ============================================================================
-# Helper functions
+# Helpers
 # ============================================================================
 
 def log(message: str) -> None:
-    """Print a standard log message for this stage."""
+    """Print a simple log message."""
     print(f"[BRONZE] {message}")
 
 
 def fail(message: str) -> int:
-    """Print an error message and return a non-zero exit code."""
+    """Print an error and return a failure code."""
     print(f"[BRONZE] ERROR: {message}")
     return 1
 
 
+def extract_crop_name(filename: str) -> str:
+    """Extract crop name from filename: 'barley.csv' -> 'barley'."""
+    return Path(filename).stem.lower()
+
+
+def parse_args() -> argparse.Namespace:
+    """Read the data directory from the command line."""
+    parser = argparse.ArgumentParser(description="Bronze ingestion for Videometer data")
+    parser.add_argument("--dir", dest="data_dir", default=DATA_DIR, help="Input data directory")
+    return parser.parse_args()
+
+
 def calculate_file_checksum(filepath: str) -> str:
-    """
-    Compute an MD5 checksum for the source file.
-
-    The checksum is stored as metadata to support traceability and to detect
-    whether the source file changed between ingestion runs.
-    """
+    """Return an MD5 checksum for the source file."""
     md5 = hashlib.md5()
-    with open(filepath, "rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            md5.update(chunk)
-    return md5.hexdigest()
+    try:
+        with open(filepath, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                md5.update(chunk)
+        return md5.hexdigest()
+    except Exception as exc:
+        log(f"WARNING: checksum skipped: {exc}")
+        return "unknown"
 
 
-def load_source_file(filepath: str) -> pd.DataFrame:
-    """
-    Load the source file as strings to preserve raw values.
+def detect_separator(filepath: str) -> str:
+    """Detect the CSV separator from the first line."""
+    if CSV_SEPARATOR:
+        return CSV_SEPARATOR
 
-    Bronze should avoid semantic casting so the source data remains close to
-    its original representation.
-    """
-    lower = filepath.lower()
+    separator = ","
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as stream:
+            first_line = stream.readline()
+            if "\t" in first_line:
+                separator = "\t"
+            elif ";" in first_line:
+                separator = ";"
+    except Exception as exc:
+        log(f"WARNING: separator detection failed: {exc}")
+
+    return separator
+
+
+def create_spark_session() -> SparkSession:
+    """Create the Spark session with MinIO settings."""
+    return (
+        SparkSession.builder
+        .appName("bronze-ingestion")
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.2")
+        .config("spark.driver.memory", "3g")
+        .config("spark.executor.memory", "3g")
+        .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+        .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", True)
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .getOrCreate()
+    )
+
+
+def load_source_file(spark: SparkSession, file_path: str):
+    """Load CSV or Excel as raw data."""
+    lower = file_path.lower()
+
     if lower.endswith(".xlsx") or lower.endswith(".xls"):
-        return pd.read_excel(filepath, dtype=str)
-    return pd.read_csv(filepath, dtype=str, low_memory=False)
+        import pandas as pd
+        df_pandas = pd.read_excel(file_path, dtype=str).fillna("")
+        df_pandas.columns = df_pandas.columns.astype(str)
+        return spark.createDataFrame(df_pandas)
 
+    separator = detect_separator(file_path)
+    log(f"Detected CSV separator: '{separator}'")
 
-def print_null_report(df: pd.DataFrame) -> None:
-    """
-    Print a non-blocking null-value report.
-
-    This step is informational only. Bronze ingestion should continue even if
-    some source columns contain missing values.
-    """
-    total_rows = len(df)
-    log(f"Quality report: total_rows={total_rows}")
-    for column in df.columns:
-        null_count = int(df[column].isna().sum())
-        if null_count > 0:
-            percentage = (100.0 * null_count / total_rows) if total_rows else 0.0
-            log(f"  NULLS {column}: {null_count} ({percentage:.2f}%)")
+    return (
+        spark.read
+        .option("header", True)
+        .option("sep", separator)
+        .option("inferSchema", False)
+        .csv(file_path)
+    )
 
 
 # ============================================================================
@@ -112,83 +137,95 @@ def print_null_report(df: pd.DataFrame) -> None:
 # ============================================================================
 
 def main() -> int:
-    """
-    Execute Bronze ingestion end to end.
+    """Run the Bronze pipeline end to end."""
+    args = parse_args()
+    data_path = Path(args.data_dir)
 
-    Steps:
-    1. Validate that the source file exists.
-    2. Load the raw dataset.
-    3. Add technical metadata columns.
-    4. Print a null-value report.
-    5. Normalize object columns to pandas string dtype.
-    6. Write the result to MinIO as Parquet.
-    7. Read the data back to verify the write.
-    """
     log("Starting Bronze ingestion")
 
-    source_path = Path(DATA_SOURCE_PATH)
-    if not source_path.exists():
-        return fail(f"Source file not found: {DATA_SOURCE_PATH}")
+    if not data_path.exists() or not data_path.is_dir():
+        return fail(f"Data directory not found: {args.data_dir}")
 
-    log(f"Source file: {DATA_SOURCE_PATH}")
+    # Find all valid files (barley.csv, chickpea.csv, etc.)
+    files_to_process = sorted([
+        f for f in data_path.iterdir() 
+        if f.is_file() and f.suffix.lower() in VALID_EXTENSIONS
+    ])
 
-    try:
-        df = load_source_file(DATA_SOURCE_PATH)
-    except Exception as exc:
-        return fail(f"Failed to load source file: {exc}")
+    if not files_to_process:
+        return fail(f"No valid data files found in {args.data_dir}")
 
-    if df.empty:
-        return fail("Source dataframe is empty; aborting Bronze write")
+    log(f"Found {len(files_to_process)} files to process")
+    for f in files_to_process:
+        log(f"  - {f.name}")
 
-    log(f"Loaded rows={len(df)}, cols={len(df.columns)}")
+    spark = create_spark_session()
+    success_count = 0
 
-    try:
-        ingestion_timestamp = datetime.now(timezone.utc).isoformat()
-        source_filename = source_path.name
-        source_checksum = calculate_file_checksum(DATA_SOURCE_PATH)
-        load_id = f"LOAD_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    # Process each file separately by crop
+    for file_path in files_to_process:
+        crop_name = extract_crop_name(file_path.name)
+        log(f"\n--- Processing {crop_name} from {file_path.name} ---")
 
-        df["ingestion_date"] = ingestion_timestamp
-        df["source_filename"] = source_filename
-        df["source_checksum"] = source_checksum
-        df["load_id"] = load_id
+        try:
+            df = load_source_file(spark, str(file_path))
+        except Exception as exc:
+            log(f"WARNING: Failed to load {file_path.name}: {exc}")
+            continue
+
+        rows_loaded = df.count()
+        cols_loaded = len(df.columns)
+
+        if rows_loaded == 0:
+            log(f"WARNING: Skipping {crop_name} (empty file)")
+            continue
+
+        log(f"Loaded rows={rows_loaded}, cols={cols_loaded}")
+
+        # Add technical metadata
+        run_time = datetime.now(timezone.utc)
+        source_filename = file_path.name
+        source_checksum = calculate_file_checksum(str(file_path))
+        load_id = f"LOAD_{run_time.strftime('%Y%m%d_%H%M%S')}"
+
+        df = df.withColumn("ingestion_date", F.lit(run_time.isoformat()))
+        df = df.withColumn("ingestion_timestamp", F.current_timestamp())
+        df = df.withColumn("source_filename", F.lit(source_filename))
+        df = df.withColumn("source_checksum", F.lit(source_checksum))
+        df = df.withColumn("load_id", F.lit(load_id))
+        df = df.withColumn("crop_type", F.lit(crop_name))
 
         log("Technical metadata added")
-        log(f"  ingestion_date={ingestion_timestamp}")
+        log(f"  crop_type={crop_name}")
         log(f"  source_filename={source_filename}")
-        log(f"  source_checksum={source_checksum}")
         log(f"  load_id={load_id}")
-    except Exception as exc:
-        return fail(f"Failed to add metadata: {exc}")
 
-    print_null_report(df)
+        # Write Bronze for this crop
+        bronze_path = f"{BRONZE_BASE}/{crop_name}/"
+        log(f"Writing Bronze to {bronze_path}")
+        try:
+            df.write.mode("overwrite").parquet(bronze_path)
+        except Exception as exc:
+            log(f"ERROR writing {crop_name}: {exc}")
+            continue
 
-    try:
-        object_columns = df.select_dtypes(include=["object"]).columns
-        for column in object_columns:
-            df[column] = df[column].astype("string")
-    except Exception as exc:
-        return fail(f"Failed to normalize object columns: {exc}")
+        # Verify the write
+        try:
+            verify = spark.read.parquet(bronze_path)
+            rows_verify = verify.count()
+            cols_verify = len(verify.columns)
 
-    log(f"Writing Bronze to {BRONZE_S3_PATH}")
-    try:
-        df.to_parquet(BRONZE_S3_PATH, index=False, storage_options=S3_STORAGE_OPTIONS)
-    except Exception as exc:
-        return fail(f"Failed to write Bronze parquet: {exc}")
+            if rows_verify != rows_loaded:
+                log(f"WARNING: Verification mismatch for {crop_name}: written={rows_loaded}, read_back={rows_verify}")
+            else:
+                log(f"✓ {crop_name} verified: rows={rows_verify}, cols={cols_verify}")
+                success_count += 1
+        except Exception as exc:
+            log(f"WARNING: Failed to verify {crop_name}: {exc}")
 
-    try:
-        verify = pd.read_parquet(BRONZE_S3_PATH, storage_options=S3_STORAGE_OPTIONS)
-    except Exception as exc:
-        return fail(f"Failed to verify Bronze read-back: {exc}")
-
-    if len(verify) != len(df):
-        return fail(
-            f"Verification mismatch rows: written={len(df)} read_back={len(verify)}"
-        )
-
-    log(f"Success: verified rows={len(verify)}, cols={len(verify.columns)}")
-    log("COMPLETE")
-    return 0
+    log(f"\nBronze ingestion COMPLETE: {success_count}/{len(files_to_process)} files processed successfully")
+    spark.stop()
+    return 0 if success_count > 0 else 1
 
 
 if __name__ == "__main__":

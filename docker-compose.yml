@@ -256,6 +256,30 @@ services:
     command: scheduler  
 
 
+
+  prediction-api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    container_name: pfe_prediction_api-2
+    depends_on:
+      mlflow:
+        condition: service_started
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-admin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minio_password}
+      MODEL_LOCAL_PATH: /opt/spark-app/data/models
+      MODEL_NAME: Videometer_Model
+      MODEL_STAGE: Production
+    volumes:
+      - ./data:/opt/spark-app/data
+      - ./scripts:/opt/spark-app/scripts
+    ports:
+      - "8000:8000"
+
+      
 volumes:
   minio_data:
   postgres_data:

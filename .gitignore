@@ -1,5 +1,7 @@
 .env
 data/
+PFE-Rapport/
+trash/
 airflow/logs/
 __pycache__/
 *.pyc
@@ -8,3 +10,5 @@ __pycache__/
 *.xlsx
 *.xls
 
+/opt/spark-app/data/models/
+/tmp/mlflow_artifacts

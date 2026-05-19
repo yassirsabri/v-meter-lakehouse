@@ -2,25 +2,24 @@
 """
 Silver transformation pipeline.
 
-Purpose
-- Read Bronze data from MinIO.
-- Validate mandatory fields and ingestion timestamps.
-- Normalize and validate the composite business key.
-- Deduplicate records using the latest ingestion timestamp.
-- Cast numeric measurement columns.
-- Apply basic sanity rules and compute data quality scores.
-- Write the curated dataset to the Silver zone in MinIO.
-
-Why this stage matters
-- Silver is the cleaned and trusted layer used for downstream analytics.
-- It removes duplicates, enforces structure, and prepares data for aggregation.
+Accepts --crop argument to read from crop-specific Bronze and write to crop-specific Silver.
+Cleans headers, detects key columns, builds id_measurement, removes duplicates,
+applies Tukey outlier filters, and computes quality metrics.
 """
 
+import argparse
+import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from pyspark import StorageLevel
+from pyspark.sql import DataFrame, SparkSession, Window
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, StringType
 
 
 # ============================================================================
@@ -32,206 +31,407 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_password")
 
 BRONZE_BUCKET = os.getenv("BRONZE_BUCKET", "bronze")
-BRONZE_KEY = os.getenv("BRONZE_KEY", "videometer/raw_measurements")
 SILVER_BUCKET = os.getenv("SILVER_BUCKET", "silver")
-SILVER_KEY = os.getenv("SILVER_KEY", "videometer/cleaned_measurements")
 
-S3_STORAGE_OPTIONS = {
-    "key": MINIO_ACCESS_KEY,
-    "secret": MINIO_SECRET_KEY,
-    "client_kwargs": {"endpoint_url": MINIO_ENDPOINT},
-    "anon": False,
-}
+BRONZE_BASE = f"s3a://{BRONZE_BUCKET}/videometer"
+SILVER_BASE = f"s3a://{SILVER_BUCKET}/videometer"
 
-# Composite business key used to identify a unique measurement.
-BUSINESS_KEY_COLUMNS = [
-    "SourceImage_ID",
-    "SourceImage_CaptureId",
-    "Filename",
-    "BlobId",
-]
-
-# Measurement columns that should be numeric in Silver.
-TARGET_NUMERIC_COLUMNS = [
-    "Area (mm2)",
-    "Length (mm)",
-    "Width (mm)",
-    "RatioWidthLength",
-    "AreaFraction",
-    "Perimeter",
-    "Compactness",
-    "Eccentricity",
-    "CIELab_L",
-    "CIELab_A",
-    "CIELab_B",
-    "ReflectanceMean",
-    "Volume",
-]
-
-# Fields that must remain strictly positive.
-POSITIVE_COLUMNS = [
-    "Area (mm2)",
-    "Length (mm)",
-    "Width (mm)",
-    "Perimeter",
-    "Volume",
-]
+LOCAL_METADATA_PATH = "/tmp/silver_metadata.json"
 
 
 # ============================================================================
-# Helper functions
+# Helpers
 # ============================================================================
 
-def fail(message: str) -> None:
-    """Print an error message and stop execution."""
+def log(message: str) -> None:
+    """Print a simple log message."""
+    print(f"[SILVER] {message}")
+
+
+def fail(message: str) -> int:
+    """Print an error and return a failure code."""
     print(f"[SILVER] ERROR: {message}")
-    sys.exit(1)
+    return 1
 
 
-def get_s3_fs():
-    """
-    Initialize an authenticated S3 filesystem client for MinIO.
-
-    This helper is kept for compatibility with environments that require
-    an explicit filesystem object.
-    """
-    try:
-        import s3fs
-        return s3fs.S3FileSystem(
-            anon=False,
-            use_ssl=False,
-            key=MINIO_ACCESS_KEY,
-            secret=MINIO_SECRET_KEY,
-            client_kwargs={"endpoint_url": MINIO_ENDPOINT},
-        )
-    except ImportError:
-        fail("s3fs not installed. Install: pip install s3fs")
+def parse_args() -> argparse.Namespace:
+    """Read the crop type from the command line."""
+    parser = argparse.ArgumentParser(description="Silver transformation")
+    parser.add_argument("--crop", dest="crop_type", default="barley",
+                       help="Crop type (e.g., barley, chickpea)")
+    return parser.parse_args()
 
 
-def ensure_required_columns(df: pd.DataFrame) -> None:
-    """
-    Verify that the minimum required columns exist before processing.
-    """
-    required = BUSINESS_KEY_COLUMNS + ["ingestion_date"]
-    missing = [column for column in required if column not in df.columns]
-    if missing:
-        fail(f"Missing required columns: {missing}")
-
-
-def parse_ingestion_timestamp(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Parse ingestion_date into a UTC timestamp.
-
-    This is a blocking validation because deduplication depends on temporal order.
-    """
-    df["ingestion_timestamp"] = pd.to_datetime(
-        df["ingestion_date"],
-        errors="coerce",
-        utc=True,
-    )
-    bad_count = int(df["ingestion_timestamp"].isna().sum())
-    if bad_count > 0:
-        fail(f"{bad_count} rows have invalid ingestion_date")
-    return df
-
-
-def normalize_business_key(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize, validate, and deduplicate the composite business key.
-
-    Processing rules:
-    - Trim whitespace from key fields.
-    - Reject null or empty key values.
-    - Deduplicate by keeping the latest record for each composite key.
-    - Build a stable technical id_measurement identifier.
-    """
-    for column in BUSINESS_KEY_COLUMNS:
-        df[column] = df[column].astype("string").str.strip()
-
-    for column in BUSINESS_KEY_COLUMNS:
-        bad_count = int(df[column].isna().sum() + (df[column] == "").sum())
-        if bad_count > 0:
-            fail(f"{bad_count} rows have null/empty {column} in business key")
-
-    duplicate_count = int(df.duplicated(subset=BUSINESS_KEY_COLUMNS).sum())
-    if duplicate_count > 0:
-        print(f"[SILVER] WARNING: {duplicate_count} duplicates on composite key, keeping latest row")
-        df = df.sort_values("ingestion_timestamp").drop_duplicates(
-            subset=BUSINESS_KEY_COLUMNS,
-            keep="last",
-        )
-
-    df["id_measurement"] = (
-        df["SourceImage_ID"].astype("string")
-        + "|"
-        + df["SourceImage_CaptureId"].astype("string")
-        + "|"
-        + df["Filename"].astype("string")
-        + "|"
-        + df["BlobId"].astype("string")
+def create_spark_session() -> SparkSession:
+    """Create the Spark session with MinIO settings."""
+    return (
+        SparkSession.builder
+        .appName("silver-transformation")
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.2")
+        .config("spark.driver.memory", "3g")
+        .config("spark.executor.memory", "3g")
+        .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+        .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", True)
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .getOrCreate()
     )
 
-    return df
+
+def clean_name(name: str) -> str:
+    """Clean a header in a readable way, keeping underscores for readability."""
+    value = str(name).strip().lower()
+    value = re.sub(r"\(unknown\)", "", value, flags=re.IGNORECASE)
+    value = value.replace("%", "pct")
+    value = re.sub(r"\[([0-9]+)\]", r"_\1", value)
+    value = re.sub(r"[^a-z0-9_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or "col"
 
 
-def cast_numeric_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def normalize_headers(df: DataFrame) -> Tuple[DataFrame, Dict[str, str]]:
+    """Rename all columns and keep a mapping."""
+    mapping: Dict[str, str] = {}
+    final_names: List[str] = []
+    seen: Dict[str, int] = {}
+
+    for original in df.columns:
+        base = clean_name(original)
+        count = seen.get(base, 0)
+        final_name = base if count == 0 else f"{base}_{count}"
+        seen[base] = count + 1
+        mapping[original] = final_name
+        final_names.append(final_name)
+
+    return df.toDF(*final_names), mapping
+
+
+def first_existing(columns: List[str], candidates: List[str]) -> Optional[str]:
+    """Return the first matching column."""
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def detect_blob_cols(columns: List[str]) -> List[str]:
+    """Find all blob id columns."""
+    candidates = ["blobid", "blob_id", "blobindex", "blob_idx", "blob"]
+    return [c for c in candidates if c in columns]
+
+
+def detect_source_cols(columns: List[str]) -> List[str]:
+    """Find all source image columns."""
+    candidates = [
+        "sourceimageid", "source_image_id", "sourceimagecaptureid",
+        "source_image_capture_id", "sourceid", "filename", "filepath", "sourcefilename"
+    ]
+    return [c for c in candidates if c in columns]
+
+
+def detect_area_cols(columns: List[str]) -> List[str]:
+    """Find all area columns."""
+    candidates = ["areamm2", "area_mm2", "area", "morphologyarea"]
+    return [c for c in candidates if c in columns]
+
+
+def infer_numeric_columns(df: DataFrame, exclude_cols: Optional[List[str]] = None, 
+                          sample_ratio: float = 0.1, numeric_threshold: float = 0.95) -> Tuple[List[str], List[str]]:
     """
-    Cast the target measurement columns to numeric dtype.
-
-    Invalid values are coerced to NaN so they can be handled by quality checks.
+    Infer numeric columns using sample-based detection.
+    Returns (numeric_cols, text_cols).
     """
-    present = []
-    for column in TARGET_NUMERIC_COLUMNS:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors="coerce")
-            present.append(column)
-    return df, present
+    if exclude_cols is None:
+        exclude_cols = []
+    
+    string_cols = [c for c, t in df.dtypes if c not in exclude_cols and t == "string"]
+    
+    if not string_cols:
+        numeric_cols = [c for c, t in df.dtypes if c not in exclude_cols and t != "string"]
+        return numeric_cols, []
+
+    # Sample-based detection to avoid full scans per column
+    sample_df = df.select(string_cols).sample(withReplacement=False, fraction=sample_ratio, seed=42)
+    pandas_sample = sample_df.toPandas()
+
+    numeric_cols = []
+    for col in string_cols:
+        s = pandas_sample[col].dropna()
+        if s.empty:
+            continue
+        converted = pd.to_numeric(s, errors="coerce")
+        ratio = converted.notna().sum() / float(len(s))
+        if ratio >= numeric_threshold:
+            numeric_cols.append(col)
+
+    # Add non-string typed numeric columns
+    for c, t in df.dtypes:
+        if c not in exclude_cols and t != "string" and t not in {"array", "struct", "binary"}:
+            numeric_cols.append(c)
+
+    text_cols = [c for c in string_cols if c not in numeric_cols]
+    
+    return sorted(numeric_cols), sorted(text_cols)
 
 
-def apply_sanity_rules(df: pd.DataFrame) -> pd.DataFrame:
+def build_measurement_id(df: DataFrame, blob_cols: List[str], source_cols: List[str]) -> DataFrame:
+    """Build the measurement id from blob and source columns."""
+    df_work = df
+
+    if blob_cols:
+        blob_expr = F.coalesce(*[F.col(c).cast(StringType()) for c in blob_cols])
+        df_work = df_work.withColumn("blob_id", F.trim(blob_expr))
+    else:
+        df_work = df_work.withColumn("blob_id", F.lit("unknown_blob"))
+
+    if source_cols:
+        source_expr = F.coalesce(*[F.col(c).cast(StringType()) for c in source_cols])
+        df_work = df_work.withColumn("source_image_id", F.trim(source_expr))
+    else:
+        df_work = df_work.withColumn("source_image_id", F.lit("unknown_source"))
+
+    return df_work.withColumn(
+        "id_measurement",
+        F.concat_ws("|", F.col("blob_id"), F.col("source_image_id"))
+    )
+
+
+def drop_duplicate_columns(df: DataFrame) -> Tuple[DataFrame, List[str]]:
     """
-    Apply domain-specific sanity checks.
-
-    Values less than or equal to zero in strictly positive fields are replaced
-    with NaN because they are considered invalid observations.
+    Drop duplicate columns using sample-based candidate detection + full verification.
+    Safe for timestamp columns by casting to string before pandas conversion.
     """
-    for column in POSITIVE_COLUMNS:
-        if column in df.columns:
-            invalid_mask = df[column] <= 0
-            invalid_count = int(invalid_mask.sum())
-            if invalid_count > 0:
-                print(f"[SILVER] WARNING: {invalid_count} invalid values in {column} (<=0), set to NaN")
-                df.loc[invalid_mask, column] = pd.NA
-    return df
+    sample = df.limit(5)
+    
+    # Cast all columns to string to avoid pandas datetime conversion issues
+    for c in sample.columns:
+        sample = sample.withColumn(c, sample[c].cast(StringType()))
+    
+    pdf = sample.toPandas()
+    signatures = {}
+    
+    for col in pdf.columns:
+        sig = tuple(map(lambda x: None if pd.isna(x) else str(x), pdf[col].tolist()))
+        signatures.setdefault(sig, []).append(col)
+
+    cols_to_drop = []
+    for sig, cols in signatures.items():
+        if len(cols) <= 1:
+            continue
+        
+        # Verify duplicates across full column using eqNullSafe on master
+        master = cols[0]
+        for other in cols[1:]:
+            diff_count = df.filter(~(F.col(master).eqNullSafe(F.col(other)))).limit(1).count()
+            if diff_count == 0:
+                cols_to_drop.append(other)
+    
+    result_df = df.drop(*cols_to_drop) if cols_to_drop else df
+    return result_df, cols_to_drop
 
 
-def compute_quality_score(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute a row-level quality score and a categorical quality status.
+def apply_area_rule(df: DataFrame, area_cols: List[str]) -> Tuple[DataFrame, int]:
+    """Remove rows where area is less than or equal to zero."""
+    existing_area_cols = [c for c in area_cols if c in df.columns]
+    if not existing_area_cols:
+        return df, 0
 
-    The score is based on missing values across a small set of core columns.
-    """
-    core_columns = [
-        column
-        for column in ["Area (mm2)", "Length (mm)", "Width (mm)", "ReflectanceMean", "Volume"]
-        if column in df.columns
+    before = df.count()
+    area_expr = F.coalesce(*[F.col(c).cast(DoubleType()) for c in existing_area_cols])
+    df_work = df.withColumn("__area_numeric", area_expr)
+    df_work = df_work.filter(F.col("__area_numeric") > 0).drop("__area_numeric")
+    after = df_work.count()
+
+    return df_work, before - after
+
+
+def deduplicate_on_id(df: DataFrame) -> Tuple[DataFrame, int]:
+    """Keep only one row per id_measurement (most recent by ingestion_timestamp)."""
+    if "id_measurement" not in df.columns:
+        return df, 0
+
+    if "ingestion_timestamp" in df.columns:
+        order_col = F.col("ingestion_timestamp").desc_nulls_last()
+    else:
+        order_col = F.lit(1).desc()
+
+    window_spec = Window.partitionBy("id_measurement").orderBy(order_col)
+    df_ranked = df.withColumn("__row_rank", F.row_number().over(window_spec))
+
+    before = df.count()
+    df_clean = df_ranked.filter(F.col("__row_rank") == 1).drop("__row_rank")
+    after = df_clean.count()
+
+    return df_clean, before - after
+
+
+def apply_tukey_filter(df: DataFrame, column_name: str, rel_error: float = 0.01) -> Tuple[DataFrame, Dict[str, Any]]:
+    """Apply Tukey IQR outlier filter on a single column."""
+    if column_name not in df.columns:
+        return df, {
+            "column": column_name,
+            "applied": False,
+            "reason": "missing_column",
+            "removed": 0,
+            "lower_fence": None,
+            "upper_fence": None,
+        }
+
+    df_work = df.withColumn("__tukey_numeric", F.col(column_name).cast(DoubleType()))
+    non_null_count = df_work.filter(F.col("__tukey_numeric").isNotNull()).limit(1).count()
+
+    if non_null_count == 0:
+        return df, {
+            "column": column_name,
+            "applied": False,
+            "reason": "not_numeric",
+            "removed": 0,
+            "lower_fence": None,
+            "upper_fence": None,
+        }
+
+    quantiles = df_work.approxQuantile("__tukey_numeric", [0.25, 0.75], rel_error)
+    if len(quantiles) != 2 or quantiles[0] is None or quantiles[1] is None:
+        return df, {
+            "column": column_name,
+            "applied": False,
+            "reason": "quantile_unavailable",
+            "removed": 0,
+            "lower_fence": None,
+            "upper_fence": None,
+        }
+
+    q1 = float(quantiles[0])
+    q3 = float(quantiles[1])
+    iqr = q3 - q1
+    lower_fence = q1 - (1.5 * iqr)
+    upper_fence = q3 + (1.5 * iqr)
+
+    before = df.count()
+    df_clean = (
+        df_work
+        .filter((F.col("__tukey_numeric") >= lower_fence) & (F.col("__tukey_numeric") <= upper_fence))
+        .drop("__tukey_numeric")
+    )
+    after = df_clean.count()
+
+    return df_clean, {
+        "column": column_name,
+        "applied": True,
+        "reason": "ok",
+        "removed": int(before - after),
+        "lower_fence": lower_fence,
+        "upper_fence": upper_fence,
+    }
+
+
+def pick_tukey_targets(columns: List[str]) -> List[str]:
+    """Pick the notebook outlier columns if they exist."""
+    targets: List[str] = []
+
+    for candidate in ["areamm2", "area_mm2", "lengthmm", "length_mm", "widthmm", "width_mm"]:
+        if candidate in columns and candidate not in targets:
+            targets.append(candidate)
+
+    spectral = first_existing(columns, ["multicolormean9", "spectralstatistics9"])
+    if spectral is None:
+        for col_name in columns:
+            if ("multicolor" in col_name or "spectral" in col_name) and col_name.endswith("9"):
+                spectral = col_name
+                break
+
+    if spectral and spectral not in targets:
+        targets.append(spectral)
+
+    return targets
+
+
+def apply_eda_outlier_filters(df: DataFrame) -> Tuple[DataFrame, List[Dict[str, Any]]]:
+    """Apply notebook Tukey logic on the right columns."""
+    reports: List[Dict[str, Any]] = []
+    targets = pick_tukey_targets(df.columns)
+
+    for column_name in targets:
+        df, report = apply_tukey_filter(df, column_name)
+        reports.append(report)
+        if report.get("applied"):
+            log(
+                f"Tukey on {column_name}: removed={report['removed']}, "
+                f"fence=[{report['lower_fence']:.4f}, {report['upper_fence']:.4f}]"
+            )
+
+    return df, reports
+
+
+def compute_quality_score(df: DataFrame, core_cols: List[str]) -> DataFrame:
+    """Compute a simple quality score from null values."""
+    valid_cols = [c for c in core_cols if c in df.columns]
+
+    if not valid_cols:
+        return (
+            df.withColumn("data_quality_score", F.lit(100.0))
+              .withColumn("dq_check_status", F.lit("all_pass"))
+        )
+
+    null_expr = None
+    for col_name in valid_cols:
+        one_null = F.when(F.col(col_name).isNull(), F.lit(1)).otherwise(F.lit(0))
+        null_expr = one_null if null_expr is None else (null_expr + one_null)
+
+    total_cols = float(len(valid_cols))
+    score_expr = F.lit(100.0) - ((null_expr.cast(DoubleType()) / F.lit(total_cols)) * F.lit(100.0))
+
+    return (
+        df.withColumn("data_quality_score", F.round(score_expr, 2))
+          .withColumn(
+              "dq_check_status",
+              F.when(F.col("data_quality_score") >= 95, F.lit("all_pass"))
+               .when(F.col("data_quality_score") >= 70, F.lit("with_warnings"))
+               .otherwise(F.lit("low_quality"))
+          )
+    )
+
+
+def build_pattern_groups(columns: List[str], numeric_cols: List[str]) -> Dict[str, Any]:
+    """Group numeric columns into spectral and morphology lists."""
+    spectral_keywords = [
+        "multicolor", "spectral", "reflectance", "transmittance", "absorbance",
+        "cie", "cielab", "srgb", "ihs", "colorband", "successivebanddiff",
     ]
 
-    if core_columns:
-        null_ratio = df[core_columns].isnull().mean(axis=1)
-        df["data_quality_score"] = (100.0 - (null_ratio * 100.0)).round(2)
-    else:
-        df["data_quality_score"] = 100.0
+    spectral_cols: List[str] = []
+    morphology_cols: List[str] = []
+    indexed_groups: Dict[str, List[str]] = {}
 
-    def status(score: float) -> str:
-        if score >= 95:
-            return "all_pass"
-        if score >= 70:
-            return "with_warnings"
-        return "low_quality"
+    for col_name in numeric_cols:
+        match = re.match(r"^(.*)_([0-9]+)$", col_name)
+        if match:
+            base = match.group(1)
+            indexed_groups.setdefault(base, []).append(col_name)
 
-    df["dq_check_status"] = df["data_quality_score"].apply(status)
-    return df
+        if any(keyword in col_name for keyword in spectral_keywords):
+            spectral_cols.append(col_name)
+        else:
+            morphology_cols.append(col_name)
+
+    for key in indexed_groups:
+        indexed_groups[key] = sorted(indexed_groups[key])
+
+    return {
+        "spectral_cols": sorted(spectral_cols),
+        "morphology_cols": sorted(morphology_cols),
+        "indexed_groups": indexed_groups,
+    }
+
+
+def write_metadata_to_minio(spark: SparkSession, metadata: Dict[str, Any], target_path: str) -> None:
+    """Write the metadata JSON to MinIO as a small file."""
+    metadata_df = spark.createDataFrame(
+        [(json.dumps(metadata, ensure_ascii=False, indent=2),)],
+        ["json_text"],
+    )
+    metadata_df.coalesce(1).write.mode("overwrite").text(target_path)
 
 
 # ============================================================================
@@ -239,52 +439,186 @@ def compute_quality_score(df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 def main() -> int:
-    """
-    Execute the Silver transformation pipeline end to end.
-    """
-    print("[SILVER] Starting...")
-    print(f"[SILVER] Reading Bronze from MinIO s3://{BRONZE_BUCKET}/{BRONZE_KEY}")
+    """Run the Silver pipeline."""
+    args = parse_args()
+    crop_type = args.crop_type.lower()
+    
+    # Construct crop-specific paths
+    BRONZE_PATH = f"{BRONZE_BASE}/{crop_type}/"
+    SILVER_PATH = f"{SILVER_BASE}/{crop_type}/"
+    
+    log(f"Starting Silver transformation for crop: {crop_type}")
+    log(f"Bronze input: {BRONZE_PATH}")
+    log(f"Silver output: {SILVER_PATH}")
+
+    spark = create_spark_session()
+
+    # Read Bronze.
+    log(f"Reading Bronze from {BRONZE_PATH}")
+    try:
+        df_bronze = spark.read.parquet(BRONZE_PATH)
+    except Exception as exc:
+        return fail(f"Failed to read Bronze: {exc}")
+
+    rows_bronze = df_bronze.count()
+    cols_bronze = len(df_bronze.columns)
+
+    if rows_bronze == 0:
+        return fail("Bronze dataframe is empty")
+
+    log(f"Bronze loaded: rows={rows_bronze}, cols={cols_bronze}")
+
+    # Cache the dataframe to avoid re-reading
+    df_bronze = df_bronze.persist(StorageLevel.MEMORY_AND_DISK)
+
+    # Clean the headers.
+    log("Normalizing headers")
+    df, header_mapping = normalize_headers(df_bronze)
+    log(f"Headers normalized: {len(header_mapping)} columns")
+
+    # Ensure time columns exist.
+    if "ingestion_date" not in df.columns:
+        df = df.withColumn("ingestion_date", F.lit(datetime.now(timezone.utc).isoformat()))
+
+    if "ingestion_timestamp" not in df.columns:
+        df = df.withColumn("ingestion_timestamp", F.current_timestamp())
+    else:
+        df = df.withColumn("ingestion_timestamp", 
+                          F.coalesce(F.to_timestamp(F.col("ingestion_timestamp")), F.current_timestamp()))
+
+    # Find the important columns.
+    columns = df.columns
+    blob_cols = detect_blob_cols(columns)
+    source_cols = detect_source_cols(columns)
+    area_cols = detect_area_cols(columns)
+
+    log(f"Detected blob columns: {blob_cols}")
+    log(f"Detected source columns: {source_cols}")
+    log(f"Detected area columns: {area_cols}")
+
+    if not blob_cols or not source_cols:
+        return fail(f"Minimal contract violated: blob_cols={blob_cols}, source_cols={source_cols}")
+
+    if not area_cols:
+        return fail("Minimal contract violated: area columns not found")
+
+    # Build the measurement id.
+    log("Building id_measurement")
+    df = build_measurement_id(df, blob_cols, source_cols)
+
+    # Detect numeric columns using sample-based approach (much faster).
+    log("Detecting numeric columns (sample-based)")
+    exclude_set = {
+        "blob_id", "source_image_id", "id_measurement", "ingestion_date",
+        "ingestion_timestamp", "processed_date", "source_filename",
+        "source_checksum", "load_id", "crop_type",
+    }
+    numeric_cols, text_cols = infer_numeric_columns(df, exclude_set, sample_ratio=0.1, numeric_threshold=0.90)
+    log(f"Numeric columns: {len(numeric_cols)}")
+    log(f"Text columns: {len(text_cols)}")
+
+    # Drop duplicated columns (safe for timestamps).
+    log("Dropping duplicated columns")
+    df, duplicate_columns_dropped = drop_duplicate_columns(df)
+    log(f"Duplicate columns dropped: {len(duplicate_columns_dropped)}")
+
+    # Apply the area rule.
+    log("Applying area rule")
+    df, area_removed = apply_area_rule(df, area_cols)
+    log(f"Rows removed by area rule: {area_removed}")
+
+    # Drop duplicated rows.
+    log("Dropping duplicated rows")
+    df, duplicate_rows_removed = deduplicate_on_id(df)
+    log(f"Rows removed by id_measurement deduplication: {duplicate_rows_removed}")
+
+    # Apply the notebook Tukey logic.
+    log("Applying Tukey filters")
+    df, tukey_reports = apply_eda_outlier_filters(df)
+    tukey_removed = sum(int(r.get("removed", 0)) for r in tukey_reports if r.get("applied"))
+    log(f"Rows removed by Tukey filters: {tukey_removed}")
+
+    # Compute a simple quality score.
+    core_candidates = [
+        "areamm2", "area_mm2", "lengthmm", "length_mm", "widthmm", "width_mm",
+        "reflectancemean", "volume",
+    ]
+    df = compute_quality_score(df, core_candidates)
+
+    # Add the processing timestamp.
+    df = df.withColumn("processed_date", F.current_timestamp())
+
+    rows_final = df.count()
+    cols_final = len(df.columns)
+    log(f"Final dataset: rows={rows_final}, cols={cols_final}")
+
+    # Build pattern groups for the next stage.
+    pattern_groups = build_pattern_groups(df.columns, numeric_cols)
+    log(f"Spectral columns: {len(pattern_groups['spectral_cols'])}")
+    log(f"Morphology columns: {len(pattern_groups['morphology_cols'])}")
+
+    # Write Silver.
+    log(f"Writing Silver to {SILVER_PATH}")
+    try:
+        df.write.mode("overwrite").parquet(SILVER_PATH)
+    except Exception as exc:
+        return fail(f"Failed to write Silver: {exc}")
+
+    # Save metadata in MinIO and keep a local fallback.
+    metadata = {
+        "run_utc": datetime.now(timezone.utc).isoformat(),
+        "crop_type": crop_type,
+        "bronze_path": BRONZE_PATH,
+        "silver_path": SILVER_PATH,
+        "raw_shape": {"rows": rows_bronze, "cols": cols_bronze},
+        "final_shape": {"rows": rows_final, "cols": cols_final},
+        "header_mapping": header_mapping,
+        "contract": {
+            "blob_cols": blob_cols,
+            "source_cols": source_cols,
+            "area_cols": area_cols,
+        },
+        "quality": {
+            "area_rows_removed": area_removed,
+            "duplicate_rows_removed": duplicate_rows_removed,
+            "duplicate_columns_dropped": duplicate_columns_dropped,
+            "tukey_rows_removed": tukey_removed,
+            "tukey_reports": tukey_reports,
+        },
+        "typing": {
+            "numeric_count": len(numeric_cols),
+            "text_count": len(text_cols),
+            "numeric_cols": sorted(numeric_cols),
+            "text_cols": sorted(text_cols),
+        },
+        "groups": {
+            "spectral_count": len(pattern_groups["spectral_cols"]),
+            "morphology_count": len(pattern_groups["morphology_cols"]),
+            "indexed_group_count": len(pattern_groups["indexed_groups"]),
+            "spectral_cols": pattern_groups["spectral_cols"],
+            "morphology_cols": pattern_groups["morphology_cols"],
+            "indexed_groups": pattern_groups["indexed_groups"],
+        },
+    }
 
     try:
-        bronze_path = f"s3://{BRONZE_BUCKET}/{BRONZE_KEY}"
-        df = pd.read_parquet(bronze_path, storage_options=S3_STORAGE_OPTIONS)
+        write_metadata_to_minio(
+            spark,
+            metadata,
+            f"s3a://{SILVER_BUCKET}/videometer/{crop_type}/metadata/silver_metadata.json",
+        )
+        log(f"Metadata saved in MinIO for {crop_type}")
     except Exception as exc:
-        fail(f"Failed to read Bronze from MinIO: {exc}")
+        log(f"WARNING: metadata upload failed, using local fallback: {exc}")
+        try:
+            with open(LOCAL_METADATA_PATH, "w", encoding="utf-8") as stream:
+                json.dump(metadata, stream, ensure_ascii=False, indent=2)
+            log(f"Metadata saved locally: {LOCAL_METADATA_PATH}")
+        except Exception as exc2:
+            log(f"WARNING: local metadata write failed: {exc2}")
 
-    if df.empty:
-        fail("Bronze dataframe is empty")
-
-    print(f"[SILVER] Loaded rows={len(df)}, cols={len(df.columns)}")
-
-    ensure_required_columns(df)
-    df = parse_ingestion_timestamp(df)
-    df = normalize_business_key(df)
-
-    df, numeric_columns_present = cast_numeric_columns(df)
-    print(f"[SILVER] Numeric columns casted: {len(numeric_columns_present)}")
-
-    df = apply_sanity_rules(df)
-
-    # Processing timestamp indicates when Silver curation occurred.
-    df["processed_date"] = datetime.now(timezone.utc).isoformat()
-    df = compute_quality_score(df)
-
-    print(f"[SILVER] Writing to MinIO s3://{SILVER_BUCKET}/{SILVER_KEY}")
-    try:
-        silver_path = f"s3://{SILVER_BUCKET}/{SILVER_KEY}"
-        df.to_parquet(silver_path, index=False, storage_options=S3_STORAGE_OPTIONS)
-    except Exception as exc:
-        fail(f"Failed to save Silver to MinIO: {exc}")
-
-    try:
-        verify = pd.read_parquet(silver_path, storage_options=S3_STORAGE_OPTIONS)
-        print(f"[SILVER] Saved to: {silver_path}")
-        print(f"[SILVER] Verification rows={len(verify)}, cols={len(verify.columns)}")
-        print(f"[SILVER] Total null cells={int(verify.isnull().sum().sum())}")
-        print("[SILVER] COMPLETE")
-    except Exception as exc:
-        print(f"[SILVER] Verification failed: {exc}")
-
+    log("COMPLETE")
+    spark.stop()
     return 0
 
 

@@ -2,22 +2,19 @@
 """
 Gold KPI aggregation pipeline.
 
-Purpose
-- Read curated Silver data from MinIO.
-- Aggregate measurements by image and date bucket.
-- Compute analytical metrics for reporting and downstream modeling.
-- Write the final KPI dataset to the Gold zone in MinIO.
-
-Why this stage matters
-- Gold is the analytics-ready layer of the medallion architecture.
-- It converts row-level measurements into business-level indicators.
+Accepts --crop argument to read from crop-specific Silver and write to crop-specific Gold.
+Groups by date and source, computes generic KPIs from numeric columns, and adds
+shape_index and quality_status metrics.
 """
 
+import argparse
 import os
 import sys
 from datetime import datetime, timezone
+from typing import List, Optional
 
-import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 
 
 # ============================================================================
@@ -29,84 +26,106 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minio_password")
 
 SILVER_BUCKET = os.getenv("SILVER_BUCKET", "silver")
-SILVER_KEY = os.getenv("SILVER_KEY", "videometer/cleaned_measurements")
 GOLD_BUCKET = os.getenv("GOLD_BUCKET", "gold")
-GOLD_KEY = os.getenv("GOLD_KEY", "videometer/kpi_viability")
 
-S3_STORAGE_OPTIONS = {
-    "key": MINIO_ACCESS_KEY,
-    "secret": MINIO_SECRET_KEY,
-    "client_kwargs": {"endpoint_url": MINIO_ENDPOINT},
-    "anon": False,
-}
-
-# Grouping dimensions for KPI aggregation.
-GROUP_KEYS = ["SourceImage_ID", "date_bucket"]
-
-# Numeric columns included in KPI calculations.
-NUMERIC_KPI_COLS = [
-    "Area (mm2)",
-    "Length (mm)",
-    "Width (mm)",
-    "RatioWidthLength",
-    "AreaFraction",
-    "Perimeter",
-    "Compactness",
-    "Eccentricity",
-    "CIELab_L",
-    "CIELab_A",
-    "CIELab_B",
-    "ReflectanceMean",
-    "Volume",
-    "data_quality_score",
-]
+SILVER_BASE = f"s3a://{SILVER_BUCKET}/videometer"
+GOLD_BASE = f"s3a://{GOLD_BUCKET}/videometer"
 
 
 # ============================================================================
-# Helper functions
+# Helpers
 # ============================================================================
 
-def fail(message: str) -> None:
-    """Print an error message and stop execution."""
-    print(f"[GOLD KPI] ERROR: {message}")
-    sys.exit(1)
+def log(message: str) -> None:
+    """Print a simple log message."""
+    print(f"[GOLD] {message}")
 
 
-def get_s3_fs():
-    """
-    Initialize an authenticated S3 filesystem client for MinIO.
-
-    This helper is kept for compatibility with environments that require
-    explicit filesystem initialization.
-    """
-    try:
-        import s3fs
-        return s3fs.S3FileSystem(
-            anon=False,
-            use_ssl=False,
-            key=MINIO_ACCESS_KEY,
-            secret=MINIO_SECRET_KEY,
-            client_kwargs={"endpoint_url": MINIO_ENDPOINT},
-        )
-    except ImportError:
-        fail("s3fs not installed. Install: pip install s3fs")
+def fail(message: str) -> int:
+    """Print an error and return a failure code."""
+    print(f"[GOLD] ERROR: {message}")
+    return 1
 
 
-def flatten_columns(columns) -> list[str]:
-    """
-    Flatten the MultiIndex columns created by pandas aggregation.
+def parse_args() -> argparse.Namespace:
+    """Read the crop type from the command line."""
+    parser = argparse.ArgumentParser(description="Gold KPI aggregation")
+    parser.add_argument("--crop", dest="crop_type", default="barley",
+                       help="Crop type (e.g., barley, chickpea)")
+    return parser.parse_args()
 
-    Example:
-    ('Area (mm2)', 'mean') -> 'Area (mm2)_mean'
-    """
-    flat = []
-    for column in columns:
-        if isinstance(column, tuple):
-            parts = [str(part) for part in column if part and str(part) != "nan"]
-            flat.append("_".join(parts))
-        else:
-            flat.append(column)
-    return flat
+
+def create_spark_session() -> SparkSession:
+    """Create the Spark session with MinIO settings."""
+    return (
+        SparkSession.builder
+        .appName("gold-kpi")
+        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.2")
+        .config("spark.driver.memory", "3g")
+        .config("spark.executor.memory", "3g")
+        .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
+        .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", True)
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .getOrCreate()
+    )
+
+
+def first_existing(columns: List[str], candidates: List[str]) -> Optional[str]:
+    """Return the first column that exists."""
+    for candidate in candidates:
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def detect_source_group_col(columns: List[str]) -> Optional[str]:
+    """Find the best source column for grouping."""
+    return first_existing(
+        columns,
+        [
+            "source_image_id",
+            "sourceimageid",
+            "source_image_capture_id",
+            "sourceimagecaptureid",
+            "source_filename",
+            "filename",
+            "filepath",
+        ],
+    )
+
+
+def detect_time_col(columns: List[str]) -> Optional[str]:
+    """Find the best timestamp column."""
+    return first_existing(
+        columns,
+        [
+            "ingestion_timestamp",
+            "processed_date",
+            "ingestion_date",
+        ],
+    )
+
+
+def numeric_columns(df) -> List[str]:
+    """Return the numeric columns we can aggregate (core morphological features only)."""
+    # Only allow core morphological features and quality metrics
+    allowed_prefixes = (
+        "area", "length", "width", "volume", "compactness",
+        "perimeter", "eccentricity", "data_quality", "ratiowidthlength"
+    )
+
+    numeric_types = {"double", "float", "int", "bigint", "smallint", "tinyint", "long", "decimal"}
+    cols = []
+    
+    for name, dtype in df.dtypes:
+        if dtype in numeric_types and name.startswith(allowed_prefixes):
+            # Exclude highly dimensional spectral bands
+            if not ("_" in name and name.split("_")[-1].isdigit() and name != "area_mm2"):
+                cols.append(name)
+    
+    return sorted(cols)
 
 
 # ============================================================================
@@ -114,96 +133,123 @@ def flatten_columns(columns) -> list[str]:
 # ============================================================================
 
 def main() -> int:
-    """
-    Execute the Gold KPI aggregation pipeline end to end.
-    """
-    print("[GOLD KPI] Starting...")
-    print(f"[GOLD KPI] Reading Silver from MinIO s3://{SILVER_BUCKET}/{SILVER_KEY}")
+    """Run the Gold KPI pipeline."""
+    args = parse_args()
+    crop_type = args.crop_type.lower()
+    
+    # Construct crop-specific paths
+    SILVER_PATH = f"{SILVER_BASE}/{crop_type}/"
+    GOLD_PATH = f"{GOLD_BASE}/{crop_type}/"
+    
+    log(f"Starting Gold KPI aggregation for crop: {crop_type}")
+    log(f"Silver input: {SILVER_PATH}")
+    log(f"Gold output: {GOLD_PATH}")
 
+    spark = create_spark_session()
+
+    # Read Silver.
+    log(f"Reading Silver from {SILVER_PATH}")
     try:
-        silver_path = f"s3://{SILVER_BUCKET}/{SILVER_KEY}"
-        df = pd.read_parquet(silver_path, storage_options=S3_STORAGE_OPTIONS)
-        print(f"[GOLD KPI] Loaded {len(df)} rows")
+        df = spark.read.parquet(SILVER_PATH)
     except Exception as exc:
-        fail(f"Failed to load Silver from MinIO: {exc}")
+        return fail(f"Failed to read Silver: {exc}")
 
-    # Required columns for aggregation and row counting.
-    required = ["SourceImage_ID", "ingestion_timestamp", "id_measurement"]
-    missing = [column for column in required if column not in df.columns]
-    if missing:
-        fail(f"Missing required columns: {missing}")
+    if df.count() == 0:
+        return fail("Silver dataframe is empty")
 
-    # Convert ingestion timestamps and derive a date-level bucket.
-    df["ingestion_timestamp"] = pd.to_datetime(
-        df["ingestion_timestamp"],
-        errors="coerce",
-        utc=True,
-    )
-    if df["ingestion_timestamp"].isna().any():
-        fail("Invalid ingestion_timestamp values")
+    columns = df.columns
+    source_col = detect_source_group_col(columns)
+    time_col = detect_time_col(columns)
 
-    df["date_bucket"] = df["ingestion_timestamp"].dt.date
+    log(f"Detected source column: {source_col}")
+    log(f"Detected time column: {time_col}")
 
-    # Keep only numeric KPI columns that are present in the dataset.
-    present_numeric = [column for column in NUMERIC_KPI_COLS if column in df.columns]
-    if not present_numeric:
-        fail("No KPI numeric columns found in Silver")
+    if time_col is None:
+        return fail("No timestamp column found in Silver")
 
-    # Aggregation plan:
-    # - count records using id_measurement
-    # - compute mean and standard deviation for numeric metrics
-    # - compute mean only for data_quality_score
-    agg_spec = {"id_measurement": "count"}
-    for column in present_numeric:
-        if column != "data_quality_score":
-            agg_spec[column] = ["mean", "std"]
-    if "data_quality_score" in present_numeric:
-        agg_spec["data_quality_score"] = "mean"
+    # Create a date bucket.
+    if time_col == "ingestion_timestamp":
+        df = df.withColumn("date_bucket", F.to_date(F.col("ingestion_timestamp")))
+    else:
+        df = df.withColumn("date_bucket", F.to_date(F.to_timestamp(F.col(time_col))))
 
-    print(f"[GOLD KPI] Aggregating by {GROUP_KEYS}...")
-    kpi = df.groupby(GROUP_KEYS).agg(agg_spec).reset_index()
-    kpi.columns = flatten_columns(kpi.columns)
+    # Find numeric columns dynamically.
+    kpi_numeric_cols = numeric_columns(df)
+    if not kpi_numeric_cols:
+        return fail("No numeric columns found for KPI aggregation")
 
-    # Rename selected output columns for readability.
-    rename_map = {
-        "id_measurement_count": "measurement_count",
-        "data_quality_score_mean": "avg_quality_score",
-    }
-    kpi = kpi.rename(columns=rename_map)
+    log(f"Numeric columns found: {len(kpi_numeric_cols)}")
+    if kpi_numeric_cols:
+        log(f"First numeric columns: {kpi_numeric_cols[:10]}")
 
-    # Derived KPI: ratio between mean area and mean length.
-    if "Area (mm2)_mean" in kpi.columns and "Length (mm)_mean" in kpi.columns:
-        kpi["shape_index"] = (kpi["Area (mm2)_mean"] / kpi["Length (mm)_mean"]).round(4)
+    # Group keys.
+    if source_col:
+        group_cols = ["date_bucket", source_col]
+    else:
+        group_cols = ["date_bucket"]
 
-    # Derived KPI: categorical quality status.
-    if "avg_quality_score" in kpi.columns:
-        kpi["quality_status"] = kpi["avg_quality_score"].apply(
-            lambda value: "all_pass"
-            if value >= 95
-            else ("with_warnings" if value >= 70 else "low_quality")
+    log(f"Grouping by: {group_cols}")
+
+    # Build the aggregation.
+    agg_spec = [F.count(F.lit(1)).alias("measurement_count")]
+
+    for col_name in kpi_numeric_cols:
+        agg_spec.append(F.mean(F.col(col_name)).alias(f"{col_name}_mean"))
+        agg_spec.append(F.stddev(F.col(col_name)).alias(f"{col_name}_std"))
+
+        if col_name in {"areamm2", "area_mm2", "lengthmm", "length_mm", "widthmm", "width_mm", "reflectancemean", "volume"}:
+            agg_spec.append(F.expr(f"percentile_approx({col_name}, 0.5, 1000)").alias(f"{col_name}_p50"))
+
+    if "data_quality_score" in columns:
+        agg_spec.append(F.mean(F.col("data_quality_score")).alias("avg_quality_score"))
+
+    kpi = df.groupBy(*group_cols).agg(*agg_spec)
+
+    # Add a simple shape index when the columns exist.
+    area_mean_cols = [c for c in kpi.columns if c.endswith("_mean") and "area" in c]
+    length_mean_cols = [c for c in kpi.columns if c.endswith("_mean") and "length" in c]
+
+    if area_mean_cols and length_mean_cols:
+        kpi = kpi.withColumn(
+            "shape_index",
+            F.round(F.col(area_mean_cols[0]) / F.col(length_mean_cols[0]), 4)
         )
 
-    # Timestamp of the Gold snapshot.
-    kpi["updated_timestamp"] = datetime.now(timezone.utc).isoformat()
+    # Add a simple quality status when the score exists.
+    if "avg_quality_score" in kpi.columns:
+        kpi = kpi.withColumn(
+            "quality_status",
+            F.when(F.col("avg_quality_score") >= 95, F.lit("all_pass"))
+             .when(F.col("avg_quality_score") >= 70, F.lit("with_warnings"))
+             .otherwise(F.lit("low_quality"))
+        )
 
-    print(f"[GOLD KPI] Writing to MinIO s3://{GOLD_BUCKET}/{GOLD_KEY}")
+    # Add the processing timestamp.
+    kpi = kpi.withColumn("updated_timestamp", F.current_timestamp())
+    kpi = kpi.withColumn("crop_type", F.lit(crop_type))
+
+    rows_out = kpi.count()
+    cols_out = len(kpi.columns)
+    log(f"Generated KPI rows={rows_out}, cols={cols_out}")
+
+    # Write Gold.
+    log(f"Writing Gold to {GOLD_PATH}")
     try:
-        gold_path = f"s3://{GOLD_BUCKET}/{GOLD_KEY}"
-        kpi.to_parquet(gold_path, index=False, storage_options=S3_STORAGE_OPTIONS)
+        kpi.write.mode("overwrite").parquet(GOLD_PATH)
     except Exception as exc:
-        fail(f"Failed to save Gold to MinIO: {exc}")
+        return fail(f"Failed to write Gold: {exc}")
 
-    # Post-write verification ensures the output is readable and complete.
+    # Verify the write.
     try:
-        verify = pd.read_parquet(gold_path, storage_options=S3_STORAGE_OPTIONS)
-        print(f"[GOLD KPI] Saved to: {gold_path}")
-        print(f"[GOLD KPI] Verification rows={len(verify)}, cols={len(verify.columns)}")
-        print(verify.head(3).to_string())
-        print("[GOLD KPI] COMPLETE")
+        verify = spark.read.parquet(GOLD_PATH)
+        rows_verify = verify.count()
+        cols_verify = len(verify.columns)
+        log(f"✓ Verification: rows={rows_verify}, cols={cols_verify}")
+        log("COMPLETE")
+        spark.stop()
+        return 0
     except Exception as exc:
-        print(f"[GOLD KPI] Verification failed: {exc}")
-
-    return 0
+        return fail(f"Failed to verify Gold write: {exc}")
 
 
 if __name__ == "__main__":
