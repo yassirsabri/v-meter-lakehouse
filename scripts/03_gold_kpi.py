@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# - Read Silver data per crop, compute KPIs by date and source
+# - Outputs aggregated Parquet to Gold path
+
 """
 Gold KPI aggregation pipeline.
 
@@ -20,6 +23,7 @@ from pyspark.sql import functions as F
 # ============================================================================
 # Configuration
 # ============================================================================
+# Spark + MinIO settings and bucket names.
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
@@ -35,6 +39,7 @@ GOLD_BASE = f"s3a://{GOLD_BUCKET}/videometer"
 # ============================================================================
 # Helpers
 # ============================================================================
+# Small helper functions for detecting columns and creating Spark sessions.
 
 def log(message: str) -> None:
     """Print a simple log message."""
@@ -131,6 +136,7 @@ def numeric_columns(df) -> List[str]:
 # ============================================================================
 # Main
 # ============================================================================
+# Main flow: read Silver, aggregate KPIs, write Gold.
 
 def main() -> int:
     """Run the Gold KPI pipeline."""

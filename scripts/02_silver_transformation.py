@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# - Read Bronze Parquet per crop, clean headers, infer numeric cols (sample-based)
+# - Remove duplicate columns/rows, apply Tukey filters, compute quality score
+# - Write cleaned Silver Parquet and metadata to MinIO/local fallback
+
 """
 Silver transformation pipeline.
 
@@ -25,6 +29,7 @@ from pyspark.sql.types import DoubleType, StringType
 # ============================================================================
 # Configuration
 # ============================================================================
+# Environment-driven configuration values used by Spark sessions and paths.
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")
@@ -42,6 +47,7 @@ LOCAL_METADATA_PATH = "/tmp/silver_metadata.json"
 # ============================================================================
 # Helpers
 # ============================================================================
+# Utility helpers: logging, argument parsing, Spark session creation, header normalization, etc.
 
 def log(message: str) -> None:
     """Print a simple log message."""
@@ -437,6 +443,7 @@ def write_metadata_to_minio(spark: SparkSession, metadata: Dict[str, Any], targe
 # ============================================================================
 # Main
 # ============================================================================
+# Main flow: read Bronze, process, write Silver, save metadata.
 
 def main() -> int:
     """Run the Silver pipeline."""

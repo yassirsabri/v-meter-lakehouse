@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# - Read Silver CSV/Parquet from MinIO
+# - Preprocess, PCA on spectral features, KMeans clustering, IsolationForest anomalies
+# - Save models locally and log metrics/artifacts to MLflow when available
+
 """
 Unsupervised Modeling & MLOps Pipeline.
 
@@ -31,6 +35,11 @@ from sklearn.ensemble import IsolationForest
 from sklearn.covariance import EllipticEnvelope
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
 
+
+# ============================================================================
+# Configuration
+# ============================================================================
+# Environment-driven settings for MinIO and MLflow, plus modeling hyperparams.
 
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin")

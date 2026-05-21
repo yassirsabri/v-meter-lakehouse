@@ -1,4 +1,4 @@
-FROM apache/airflow:2.8.0-python3.12
+FROM apache/airflow:2.9.3-python3.11
 
 USER root
 
@@ -17,7 +17,7 @@ USER airflow
 
 RUN pip install --no-cache-dir \
     pandas==2.1.4 \
-    pyarrow==16.1.0 \
+    pyarrow==15.0.2 \
     s3fs==2023.12.2 \
     openpyxl==3.1.5 \
     boto3==1.34.162 \

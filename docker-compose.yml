@@ -181,7 +181,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==15.0.2 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
 
 
       MINIO_ENDPOINT: http://minio:9000
@@ -200,7 +200,10 @@ services:
       "
 
   airflow-webserver:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: pfe-lakehouse-airflow:latest
     container_name: pfe_airflow_webserver-2
     depends_on:
       airflow-init:
@@ -214,7 +217,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==15.0.2 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: minio_password
@@ -229,7 +232,10 @@ services:
     command: webserver
 
   airflow-scheduler:
-    image: apache/airflow:2.9.3
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+    image: pfe-lakehouse-airflow:latest
     container_name: pfe_airflow_scheduler-2
     depends_on:
       airflow-init:
@@ -243,7 +249,7 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://postgres:postgres_password@postgres:5432/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__FERNET_KEY: "xJTMmtf4RO4UbEWw5dOS9BuobBISQ21gVc-7lx2Q8go="
-      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==16.1.0 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
+      _PIP_ADDITIONAL_REQUIREMENTS: pandas==2.1.4 pyarrow==15.0.2 s3fs==2023.12.2 openpyxl==3.1.5 boto3==1.34.131
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: admin
       MINIO_SECRET_KEY: minio_password

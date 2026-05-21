@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# - Auto-discovers CSV/XLSX files in data dir
+# - Loads each file with Spark, adds technical metadata
+# - Writes a Parquet per crop under the Bronze path
+
 """
 Bronze ingestion pipeline.
 
@@ -20,6 +24,7 @@ from pyspark.sql import functions as F
 # ============================================================================
 # Configuration
 # ============================================================================
+# (configuration constants are unchanged)
 
 DATA_DIR = "/opt/spark-app/data"
 VALID_EXTENSIONS = {".csv", ".xlsx", ".xls"}
@@ -37,6 +42,7 @@ CSV_SEPARATOR = os.getenv("CSV_SEPARATOR", "")
 # ============================================================================
 # Helpers
 # ============================================================================
+# Small utility functions used by main()
 
 def log(message: str) -> None:
     """Print a simple log message."""
@@ -135,6 +141,7 @@ def load_source_file(spark: SparkSession, file_path: str):
 # ============================================================================
 # Main
 # ============================================================================
+# The main flow processes every valid file found under the data directory.
 
 def main() -> int:
     """Run the Bronze pipeline end to end."""

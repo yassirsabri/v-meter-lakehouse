@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# - Loads a model from MLflow registry or falls back to a local MLflow model folder
+# - Exposes /, /health, and /predict endpoints
+
 """
 Unified Prediction API using FastAPI and MLflow.
 
@@ -19,6 +22,11 @@ import mlflow.pyfunc
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# ============================================================================
+# Configuration
+# ============================================================================
+# Environment variables that control MLflow endpoint, MinIO, and model locations.
 
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
@@ -56,6 +64,7 @@ def _load_local_model_fallback():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load model on startup: try registry first, then local fallback
     global mlflow_model, mlflow_model_source
 
     print(f"Connecting to MLflow at {MLFLOW_TRACKING_URI}")
