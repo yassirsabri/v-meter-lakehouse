@@ -1,45 +1,35 @@
-# Setup
+# Setup Guide
 
 ## Requirements
-
-- Docker Desktop
-- Docker Compose
+- Docker Desktop (with Docker Compose v2 enabled)
 - A terminal opened in the project folder
 
-## Start the environment
+## Installation Steps
 
-```bash
+1. **Clean prior states**:
+   ```bash
+   docker compose down -v
+
+
+  Boot the platform:
+
+
 docker compose up -d --build
-```
 
-## Check the services
+Verify the Initializers:
+The services postgres-init and minio-init will run briefly to create isolated databases and buckets. Ensure they exit with status 0 (Success).
 
-Open the following interfaces in the browser:
+Access UI Consoles:
 
-- MinIO Console: `http://localhost:9001`
-- Spark Master: `http://localhost:8080`
-- Airflow: `http://localhost:8088`
-- MLflow: `http://localhost:5000`
-- Nessie: `http://localhost:19120`
+MinIO Console: http://localhost:9001
 
-## Run the pipeline
+Spark Master: http://localhost:8080
 
-The pipeline can be executed either from Airflow or manually using the scripts in the `scripts` folder.
+Airflow: http://localhost:8088
 
-### Airflow
+MLflow: http://localhost:5000
 
-- Open the Airflow interface
-- Trigger the `medallion_pipeline` workflow
+Prediction API Docs: http://localhost:8000/docs
 
-### Manual execution
-
-Run the three scripts in order:
-
-1. `01_bronze_ingestion.py`
-2. `02_silver_transformation.py`
-3. `03_gold_kpi.py`
-
-## Notes
-
-- The source file is expected in the mounted `data` folder.
-- MinIO credentials are taken from the environment or Docker Compose.
+Run Workflows:
+Log into Airflow (admin/admin) and trigger medallion_pipeline, followed by mlops_pipeline.

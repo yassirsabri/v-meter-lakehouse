@@ -1,19 +1,11 @@
-# Limitations
+# Platform Boundaries
 
-This project is currently running in a local environment and is not yet deployed to a cloud platform.
+This project serves as a fully featured, production-ready local deliverable. However, standard architectural boundaries apply for its current iteration:
 
-## Current limitations
+## Current Operational Limits
 
-- The documentation is still being finalized.
-- The current pipeline is designed for a single local environment.
-- Data is stored in MinIO buckets and versioning is not yet fully implemented in practice.
-- Bronze, Silver, and Gold outputs are overwritten when the pipeline is executed again.
-- There is no automatic partitioning strategy yet for historical loads.
-- Monitoring is currently limited to local Airflow and service logs.
-- The machine learning workstreams are not yet integrated into this repository.
+- **Cluster Scalability**: The Apache Spark component is currently configured as a single-node cluster (one Master, one Worker). True horizontal scaling would require migrating to Kubernetes or a managed cloud environment.
+- **Storage Redundancy**: Persistent storage relies on local Docker volumes (`minio_data` and `postgres_data`). Disaster recovery relies on manual backups, as distributed failover is not implemented.
+- **Schema Evolution**: The Silver transformation logic infers data types via sampling. Processing highly mutated schemas across datasets without warning may cause downstream Spark typing errors.
+- **Security**: The platform utilizes default HTTP routing and basic authentication. It is not currently hardened with SSL/TLS certificates for deployment on public-facing external networks.
 
-## Silver transformation limitations
-
-- The Silver processing logic must be revised because some transformations are not necessary.
-- Processing multiple files from the data folder into the s3:/bronze zone has not been tested yet.
-- The current Silver logic assumes that database columns are known in advance; schema-agnostic processing is not implemented yet.

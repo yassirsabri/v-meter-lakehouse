@@ -1,72 +1,44 @@
-# V-Meter Lakehouse (PFE)
+# Videometer Lakehouse & MLOps Platform
 
-This repository is part of the final year internship project:
+This repository contains a fully automated, production-ready, containerized lakehouse and MLOps stack for the Videometer project.
 
-Design and Implementation of a Containerized Lakehouse Architecture for Videometer Big Data and Predictive Modeling.
+## Architecture Highlights
 
-## Project Scope
+The platform integrates data engineering and machine learning workflows seamlessly:
 
-- Build a containerized open source lakehouse platform.
-- Implement a medallion data pipeline:
-  - Bronze layer for raw ingestion.
-  - Silver layer for cleaning, standardization, and data quality checks.
-  - Gold layer for key performance indicator aggregation.
-- Orchestrate pipeline execution with Apache Airflow.
-- Prepare the platform for predictive modeling workflows.
+1. **Medallion Data Pipeline**: Orchestrated by Airflow (DAG 1), it processes raw crop image data through Bronze (ingestion), Silver (cleaning), and Gold (aggregation) layers.
+2. **Automated MLOps Pipeline**: Orchestrated by Airflow (DAG 2), it dynamically discovers labeled datasets, trains XGBoost/RandomForest models, and tracks parameters, metrics, and artifacts via MLflow.
+3. **Zero-Downtime Prediction API**: A FastAPI service that serves real-time inferences. It automatically hot-reloads the latest promoted model from the MLflow registry immediately after the MLOps pipeline finishes training.
+4. **Isolated Metadata Stores**: PostgreSQL is initialized with strictly isolated databases (`airflow`, `mlflow`, `nessie`) to prevent schema collisions and guarantee transactional safety.
 
 ## Technology Stack
 
-- Docker Compose
-- Apache Spark
-- Apache Airflow
-- MinIO (S3-compatible object storage)
-- PostgreSQL
-- MLflow
-- Project Nessie
+- **Data Processing**: Apache Spark
+- **Object Storage**: MinIO (S3 compatible)
+- **Metadata & Catalog**: PostgreSQL, Project Nessie
+- **Orchestration**: Apache Airflow
+- **Machine Learning**: MLflow, Scikit-Learn, XGBoost
+- **Inference Serving**: FastAPI
 
-## Repository Structure
+## Repository Layout
 
-- [airflow](airflow)
-- [docker](docker)
-- [scripts](scripts)
-- [docs](docs)
-- [docker-compose.yml](docker-compose.yml)
-- [STARTUP.MD](STARTUP.MD)
+- `airflow/`: Airflow DAGs (`medallion_pipeline.py`, `mlops_pipeline.py`), logs, and plugins
+- `docker/`: Dockerfiles for Airflow, API, Spark, and MLflow
+- `scripts/`: Bronze, Silver, Gold data scripts, Supervised training scripts, and API
+- `data/`: Source data and generated local model bundles
+- `docs/`: Setup, architecture, pipeline, and limitations documentation
+
+## Prerequisites
+
+Before starting the project, ensure you have installed:
+
+- Docker Desktop (with Docker Compose v2 enabled)
+- Minimum 8GB RAM allocated to Docker
+- Git
 
 ## Quick Start
 
-1. Start all services:
+Build and start the fully automated infrastructure:
 
+```bash
 docker compose up -d --build
-
-2. Verify running services:
-
-docker compose ps -a
-
-3. Open local interfaces:
-
-- MinIO Console: http://localhost:9001
-- Spark Master UI: http://localhost:8080
-- Airflow UI: http://localhost:8088
-- MLflow UI: http://localhost:5000
-- Nessie API: http://localhost:19120
-
-## Pipeline Execution
-
-Run through Airflow by triggering the medallion_pipeline workflow, or run scripts manually in this order:
-
-1. scripts/01_bronze_ingestion.py
-2. scripts/02_silver_transformation.py
-3. scripts/03_gold_kpi.py
-
-## Documentation
-
-- [Project overview](docs/overview.md)
-- [Architecture](docs/architecture.md)
-- [Setup](docs/setup.md)
-- [Pipeline](docs/pipeline.md)
-- [Limitations](docs/limitations.md)
-
-## License
-
-See [LICENSE](LICENSE).

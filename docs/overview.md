@@ -1,28 +1,25 @@
 # Project Overview
 
-This repository is part of the final year internship project:
+This repository is part of the final-year engineering project:
 
-Design and Implementation of a Containerized Lakehouse Architecture for Videometer Big Data and Predictive Modeling.
+**Design and Implementation of a Containerized Lakehouse Architecture for Videometer Big Data and Predictive Modeling.**
 
-The project focuses on building a practical open source lakehouse stack for high-dimensional data, then using it for data preparation and predictive modeling workflows.
+The project focuses on building a practical, automated open-source lakehouse stack for high-dimensional data, seamlessly integrating data engineering preparation with MLOps workflows.
 
 ## Main Scope
 
-- Benchmark open source solutions for a feature lakehouse context.
-- Build a containerized environment with Docker Compose.
-- Implement medallion ingestion layers:
-  - Bronze for raw ingestion
-  - Silver for cleaning and standardization
-  - Gold for aggregated key performance indicators
-- Prepare scenario-based modeling use cases, including:
-  - population type classification
-  - viability prediction
-- Support model lifecycle management with MLflow:
-  - hyperparameter logging
-  - model version tracking
-  - feature importance tracking
-- Prepare a unified prediction API and analytical dashboards as project targets.
+- Architect a fully containerized, production-ready environment using Docker Compose with strict database isolation for transactional safety.
+- Implement a robust Medallion data pipeline orchestrated by Apache Airflow:
+  - **Bronze**: Raw data ingestion
+  - **Silver**: Data cleaning, deduplication, and standardization
+  - **Gold**: Aggregated key performance indicators (KPIs)
+- Prepare scenario-based predictive modeling use cases, with a primary focus on crop viability prediction.
+- Automate the end-to-end machine learning lifecycle using MLflow, including:
+  - Dynamic dataset discovery and supervised training.
+  - Model evaluation, hyperparameter logging, and feature importance tracking.
+  - Automated model registration and artifact versioning.
+- Deploy a unified, zero-downtime Prediction API capable of hot-reloading active models directly from the registry without dropping requests.
 
-## Current Repository Focus
+## Current Repository Status
 
-At this stage, the repository contains the containerized data platform and the Bronze, Silver, and Gold pipeline implementation, with Airflow orchestration for execution flow.
+The repository represents a complete, decoupled production deliverable. It fully integrates the containerized data platform, the automated Medallion data preparation pipeline (DAG 1), the MLOps training and tracking pipeline (DAG 2), and the real-time inference serving layer.

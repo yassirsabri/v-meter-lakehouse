@@ -1,35 +1,14 @@
-# Pipeline
+# Data & MLOps Pipelines
 
-## Bronze
+The infrastructure operates via two interconnected pipelines orchestrated by Airflow.
 
-The Bronze stage reads the raw source file and writes it to MinIO with technical metadata.
+## 1. Medallion Data Pipeline
+- **Bronze**: Raw data ingestion. Auto-discovers files, attaches technical tracking metadata, and writes to MinIO.
+- **Silver**: Data quality and standardization. Cleans headers, removes duplicates, filters outliers via Tukey fences, and drops empty rows.
+- **Gold**: Business aggregation. Computes grouped Key Performance Indicators (KPIs), morphology statistics, and shape indices.
 
-This stage keeps the data as close as possible to the original source.
-
-## Silver
-
-The Silver stage reads the Bronze data and performs the following steps:
-- validates required columns
-- parses timestamps
-- normalizes the business key
-- removes duplicates
-- casts numeric columns
-- applies simple sanity rules
-- computes a row-level quality score
-
-## Gold
-
-The Gold stage reads the Silver data and creates aggregated key performance indicators.
-
-This stage groups the data by image and date, then calculates:
-- measurement count
-- mean values
-- standard deviation values
-- shape index
-- quality status
-
-## Orchestration
-
-Apache Airflow runs the pipeline in this order:
-
-Bronze -> Silver -> Gold
+## 2. MLOps Pipeline
+- **Auto-Discovery**: Scans designated supervised learning directories for ready-to-train datasets.
+- **Supervised Training**: Applies class-weighting and trains XGBoost/Random Forest classifiers.
+- **MLflow Tracking**: Logs confusion matrices, feature importance graphs, F1-Scores, and full model bundles directly into the MinIO backend via MLflow.
+- **Hot-Reloading**: Automates model deployment by pinging the FastAPI inference engine to fetch the newest model artifacts without interrupting web traffic.

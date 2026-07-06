@@ -1,14 +1,16 @@
 .env
-data/
-PFE-Rapport/
 trash/
 airflow/logs/
 __pycache__/
 *.pyc
 *.parquet
-*.csv
 *.xlsx
 *.xls
+*.txt
 
 /opt/spark-app/data/models/
 /tmp/mlflow_artifacts
+data/
+data_for_supervised_ml/
+*.csv
+PFE-Rapport/

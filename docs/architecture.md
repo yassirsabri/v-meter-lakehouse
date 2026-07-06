@@ -1,26 +1,19 @@
+# System Architecture
 
-# Architecture
+The Videometer Lakehouse platform is designed with a decoupled, production-grade microservices architecture. 
 
-The project uses the following components:
+## Component Overview
 
-- Docker Compose to start the local environment
-- Apache Spark to process the data
-- MinIO to store Bronze, Silver, and Gold outputs
-- PostgreSQL to store metadata for supporting services
-- Apache Airflow to orchestrate the pipeline
-- MLflow for model tracking infrastructure
-- Nessie for versioned data management infrastructure
+1. **Storage Tier**: MinIO provides an S3-compatible object storage layer containing isolated buckets (`bronze`, `silver`, `gold`, `mlflow`). 
+2. **Compute Tier**: An Apache Spark Standalone cluster (Master/Worker) executes distributed data transformations.
+3. **Database Tier**: A single PostgreSQL instance provides state management. Crucially, databases are strictly isolated at startup (`airflow`, `mlflow`, `nessie`) preventing schema corruption.
+4. **Orchestration Tier**: Apache Airflow schedules and executes both data preparation and model training workflows.
+5. **MLOps Tier**: MLflow manages the lifecycle, tracking metrics, and archiving artifacts for all trained models. Project Nessie versions the data catalog.
+6. **Inference Tier**: FastAPI hosts the Prediction API.
 
-## Data Flow
+## Workflow Integration
 
-1. The raw CSV file is read from the mounted `data/` folder.
-2. The Bronze script stores the raw data in MinIO and adds technical metadata.
-3. The Silver script reads the Bronze data, cleans it, and removes duplicates.
-4. The Gold script reads the Silver data and creates aggregated key performance indicators.
-5. Airflow runs the three scripts in sequence.
+The system natively links Data Engineering and Data Science:
 
-## Storage Zones
-
-- Bronze: raw data
-- Silver: cleaned data
-
+- **Decoupled DAGs**: The data transformation logic and model training logic run in separate DAGs. This guarantees that failures in model convergence do not halt data analytics pipelines.
+- **Zero-Downtime Synchronization**: When the MLOps DAG successfully trains a new model, it executes an HTTP POST request to the API's `/reload` endpoint. The API seamlessly hot-swaps the model in memory.
