@@ -30,7 +30,7 @@ def discover_crops():
 CROPS = discover_crops()
 
 with DAG(
-    dag_id="medallion_pipeline",
+    dag_id="medallion_pipeline_v2",
     start_date=datetime(2026, 1, 1),
     schedule=None,
     catchup=False,
@@ -44,25 +44,24 @@ with DAG(
         bash_command="python /opt/spark-app/scripts/01_bronze_ingestion.py",
     )
 
-    # Dynamically create Silver and Gold tasks per discovered crop
-    silver_tasks = []
-    gold_tasks = []
-    
     for crop in CROPS:
         silver = BashOperator(
             task_id=f"silver_{crop}",
             bash_command=f"python /opt/spark-app/scripts/02_silver_transformation.py --crop {crop}",
         )
-        silver_tasks.append(silver)
+
+        # TÂCHE NON-SUPERVISÉE AJOUTÉE ICI
+        unsupervised = BashOperator(
+            task_id=f"unsupervised_ml_{crop}",
+            bash_command=f"python /opt/spark-app/scripts/04_unsupervised_modeling.py --crop {crop}",
+        )
 
         gold = BashOperator(
             task_id=f"gold_{crop}",
             bash_command=f"python /opt/spark-app/scripts/03_gold_kpi.py --crop {crop}",
         )
-        gold_tasks.append(gold)
 
-        # Chain: silver -> gold for each crop
+        # CHAINAGE : Bronze -> Silver, puis Silver déclenche Unsupervised et Gold en parallèle
+        bronze >> silver
+        silver >> unsupervised
         silver >> gold
-
-    # Chain: bronze -> all silvers -> all golds
-    bronze >> silver_tasks

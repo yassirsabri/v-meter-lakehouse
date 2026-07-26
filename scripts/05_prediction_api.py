@@ -18,10 +18,14 @@ import numpy as np
 import pandas as pd
 import mlflow
 import mlflow.pyfunc
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import joblib
+import pyarrow.compute as pc
+
 
 # ============================================================================
 # Configuration
@@ -253,6 +257,107 @@ def predict(request: PredictionRequest):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Prediction failed: {str(exc)}")
 
+@app.get("/data/bronze")
+def query_bronze_by_accession(
+    accessions: str = Query(..., description="Comma-separated list of accessions (e.g., 8586, 16988)"),
+    crop: str = Query(None, description="(Optional) Restrict search to a specific crop type (e.g., barley)"),
+    limit: int = Query(50, ge=1, le=5000)
+):
+    """
+    Query the Bronze data layer efficiently using Predicate Pushdown.
+    Searches across all crops simultaneously by default.
+    """
+    import pyarrow as pa
+    import pyarrow.dataset as ds
+    import pyarrow.fs as pafs
+    import pyarrow.compute as pc
+    import pandas as pd
+    
+    raw_list = [acc.strip() for acc in accessions.split(",")]
+    expanded_list = []
+    
+    # Variations intelligentes pour la recherche
+    for acc in raw_list:
+        expanded_list.append(acc)
+        if not acc.lower().endswith(".png"):
+            expanded_list.append(f"{acc}.png")
+            expanded_list.append(f"{acc}.PNG")
+            expanded_list.append(f"{acc}.jpg")
+    
+    endpoint_url = os.environ.get("MLFLOW_S3_ENDPOINT_URL", "http://minio:9000")
+    scheme = "https" if endpoint_url.startswith("https") else "http"
+    endpoint_override = endpoint_url.replace(f"{scheme}://", "")
+    
+    try:
+        s3_fs = pafs.S3FileSystem(
+            endpoint_override=endpoint_override,
+            access_key=os.environ.get("AWS_ACCESS_KEY_ID", "admin"),
+            secret_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "minio_password"),
+            scheme=scheme
+        )
+        
+        bronze_bucket = os.getenv("BRONZE_BUCKET", "bronze")
+        base_path = f"{bronze_bucket}/warehouse/bronze"
+        
+        selector = pafs.FileSelector(base_path, recursive=True)
+        try:
+            file_infos = s3_fs.get_file_info(selector)
+        except Exception:
+            raise HTTPException(status_code=404, detail="No Bronze data warehouse found.")
+
+        parquet_files = []
+        for f in file_infos:
+            if f.type == pafs.FileType.File and f.path.endswith('.parquet'):
+                if crop:
+                    if f"{crop}_" in f.path.lower() or f"/{crop}/" in f.path.lower():
+                        parquet_files.append(f.path)
+                else:
+                    parquet_files.append(f.path)
+        
+        if not parquet_files:
+            raise HTTPException(status_code=404, detail="No Parquet data files found in the datalake.")
+
+        results = []
+        for p_file in parquet_files:
+            try:
+                dataset = ds.dataset([p_file], format="parquet", filesystem=s3_fs)
+                condition = pc.is_in(ds.field("Filename"), value_set=pa.array(expanded_list))
+                scanner = dataset.scanner(filter=condition)
+                table = scanner.head(limit) 
+                
+                if table.num_rows > 0:
+                    results.append(table.to_pandas())
+            except Exception as e:
+                print(f"Skipping {p_file} due to error: {e}")
+                continue
+        
+        if not results:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"The requested accessions were not found in the dataset. (Searched for: {', '.join(expanded_list)})"
+            )
+            
+
+        # On fusionne avec Pandas
+        df_result = pd.concat(results, ignore_index=True)
+        
+        # LA VRAIE CORRECTION EST ICI : On force la limite GLOBALE sur le résultat final
+        df_result = df_result.head(limit)
+        
+        # Destruction totale des NaN, inf et -inf pour JSON
+        df_result = df_result.astype(object).replace([np.inf, -np.inf, np.nan], None)
+            
+        return {
+            "scanned_crops": "All" if not crop else crop,
+            "requested_accessions": raw_list,
+            "rows_returned": len(df_result),
+            "data": df_result.to_dict(orient="records")
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Server Error: {str(exc)}")
 
 if __name__ == "__main__":
     import uvicorn

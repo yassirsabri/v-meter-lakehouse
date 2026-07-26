@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir --upgrade pip \
     fastapi \
     uvicorn \
     pandas==2.2.3 \
+    pyarrow==15.0.2 \
     mlflow==2.14.3 \
     boto3==1.34.162 \
     scikit-learn==1.5.2 \

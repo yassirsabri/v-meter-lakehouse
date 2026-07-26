@@ -69,18 +69,44 @@ def parse_args() -> argparse.Namespace:
 
 
 def create_spark_session() -> SparkSession:
-    """Create the Spark session with MinIO settings."""
+    """Create the Spark session with MinIO, Iceberg, and Nessie catalog settings."""
+    NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie:19120/api/v1")
+    WAREHOUSE_PATH = f"s3a://{os.getenv('BRONZE_BUCKET', 'bronze')}/warehouse"
+    
     return (
         SparkSession.builder
-        .appName("silver-transformation")
-        .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.2")
-        .config("spark.driver.memory", "3g")
-        .config("spark.executor.memory", "3g")
+        .appName("lakehouse-pipeline")
+        # --- Packages ---
+        .config("spark.jars.packages", 
+                "org.apache.hadoop:hadoop-aws:3.3.4,"
+                "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.4.3,"
+                "org.projectnessie.nessie-integrations:nessie-spark-extensions-3.3_2.12:0.76.6")
+        
+        # --- Extensions Iceberg/Nessie ---
+        .config("spark.sql.extensions", 
+                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions,"
+                "org.projectnessie.spark.extensions.NessieSparkSessionExtensions")
+        
+        # --- Configuration S3 (MinIO) ---
         .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
         .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
         .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
-        .config("spark.hadoop.fs.s3a.path.style.access", True)
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+        
+        # --- Configuration du Catalogue Nessie ---
+        .config("spark.sql.catalog.nessie", "org.apache.iceberg.spark.SparkCatalog")
+        .config("spark.sql.catalog.nessie.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog")
+        .config("spark.sql.catalog.nessie.uri", NESSIE_URI)
+        .config("spark.sql.catalog.nessie.ref", "main")
+        .config("spark.sql.catalog.nessie.authentication.type", "NONE")
+        .config("spark.sql.catalog.nessie.warehouse", WAREHOUSE_PATH)
+        .config("spark.sql.catalog.nessie.s3.endpoint", MINIO_ENDPOINT)
+        
+        # --- Optimisations ---
+        .config("spark.driver.memory", "3g")
+        .config("spark.executor.memory", "3g")
         .getOrCreate()
     )
 
@@ -463,7 +489,7 @@ def main() -> int:
     # Read Bronze.
     log(f"Reading Bronze from {BRONZE_PATH}")
     try:
-        df_bronze = spark.read.parquet(BRONZE_PATH)
+        df_bronze = spark.read.format("iceberg").load(f"nessie.bronze.{crop_type}")
     except Exception as exc:
         return fail(f"Failed to read Bronze: {exc}")
 
@@ -565,11 +591,16 @@ def main() -> int:
     log(f"Morphology columns: {len(pattern_groups['morphology_cols'])}")
 
     # Write Silver.
-    log(f"Writing Silver to {SILVER_PATH}")
+    # Write Silver to Nessie / Iceberg
+    log("Création du namespace (base de données) dans Nessie si inexistant")
+    spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
+    
+    table_name = f"nessie.silver.{crop_type}"
+    log(f"Writing Iceberg table: {table_name}")
     try:
-        df.write.mode("overwrite").parquet(SILVER_PATH)
+        df.write.format("iceberg").mode("overwrite").saveAsTable(table_name)
     except Exception as exc:
-        return fail(f"Failed to write Silver: {exc}")
+        return fail(f"Failed to write Silver to Nessie: {exc}")
 
     # Save metadata in MinIO and keep a local fallback.
     metadata = {

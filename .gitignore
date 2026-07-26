@@ -1,16 +1,36 @@
-.env
+
 trash/
 airflow/logs/
-__pycache__/
-*.pyc
 *.parquet
 *.xlsx
+*.csv
 *.xls
+*.png
+*.PNG
+*.jpg
+*.JPG
+*.jpeg
+*.JPEG
+*.joblib
 *.txt
 
+PFE-Rapport/
 /opt/spark-app/data/models/
 /tmp/mlflow_artifacts
-data/
-data_for_supervised_ml/
-*.csv
-PFE-Rapport/
+/data/
+/data_for_supervised_ml/
+
+# Python and Environments
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+
+# Docker volumes (if accidentally created locally)
+postgres_data/
+minio_data/
+
+# OS generated files
+.DS_Store
+code_snapshot.txt
